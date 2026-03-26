@@ -1,0 +1,28 @@
+# ----------------------------
+# Python Cache / Bytecode
+# ----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*$py.class
+
+# ----------------------------
+# Virtual Environment
+# ----------------------------
+venv/
+env/
+.venv/
+
+# ----------------------------
+# Selenium / WebDriver Manager cache
+# ----------------------------
+~/.wdm/
+webdriver/
+drivers/
+.chromedriver/
+chromedriver.log
+
+# ----------------------------
+# Logs
+# ----------------------------

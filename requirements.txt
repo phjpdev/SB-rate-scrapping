@@ -3,3 +3,4 @@ openpyxl==3.1.2
 fake-useragent==1.5.1
 selenium==4.20.0
 webdriver_manager==4.0.2
+pywin32>=306

@@ -3,6 +3,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -440,17 +441,156 @@ def save_sb_to_excel(excel_file, SR):
     try:
         workbook.save(excel_file)
         print(f"Workbook saved: {excel_file}", flush=True)
+        return
     except PermissionError:
-        # Common on Windows when the workbook is open in Excel.
-        base, ext = os.path.splitext(excel_file)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        alt = f"{base}_UPDATED_{ts}{ext or '.xlsm'}"
-        workbook.save(alt)
+        # If Excel has the workbook open, OpenPyXL can't overwrite it.
+        # Use Excel COM automation to write + Save() in-place.
         print(
-            f"Could not overwrite '{excel_file}' (file is in use). "
-            f"Saved to: {alt}. Close Excel then rename/replace if needed.",
+            f"'{excel_file}' is in use (likely open in Excel). "
+            "Attempting to save via Excel...",
             flush=True,
         )
+
+    save_sb_to_excel_via_excel_com(excel_file, SR)
+
+
+def save_sb_to_excel_via_excel_com(excel_file: str, SR: dict) -> None:
+    try:
+        import win32com.client  # type: ignore
+        import pywintypes  # type: ignore
+    except Exception as e:
+        print(
+            "Excel file is locked and Excel-automation is unavailable. "
+            "Install it with: pip install pywin32",
+            flush=True,
+        )
+        return
+
+    excel_file_abs = str(Path(excel_file).resolve())
+    target_name = Path(excel_file_abs).name.lower()
+
+    xl = None
+    wb = None
+
+    try:
+        try:
+            xl = win32com.client.GetActiveObject("Excel.Application")
+        except Exception:
+            print(
+                "Excel is not running. Close the workbook (or open Excel) and rerun.",
+                flush=True,
+            )
+            return
+
+        # Find already-open workbook IN THIS EXCEL INSTANCE.
+        # IMPORTANT: do NOT open a second copy (can cause sharing violation).
+        for w in xl.Workbooks:
+            try:
+                full = str(getattr(w, "FullName", "") or "")
+                name = str(getattr(w, "Name", "") or "")
+                if full and full.lower() == excel_file_abs.lower():
+                    wb = w
+                    break
+                if name and name.lower() == target_name:
+                    wb = w  # fallback match by name
+            except Exception:
+                continue
+
+        if wb is None:
+            print(
+                f"Workbook not found among open Excel workbooks: {excel_file_abs}. "
+                "Make sure THIS file is open (and only in one Excel instance), then rerun.",
+                flush=True,
+            )
+            return
+
+        try:
+            if bool(getattr(wb, "ReadOnly", False)):
+                print(
+                    f"Workbook is open read-only in Excel, cannot save in-place: {excel_file_abs}",
+                    flush=True,
+                )
+                return
+        except Exception:
+            pass
+
+        # avoid prompts interrupting automation
+        prev_alerts = xl.DisplayAlerts
+        xl.DisplayAlerts = False
+
+        try:
+            for ws in wb.Worksheets:
+                sheet_name = str(ws.Name)
+                if sheet_name in NON_MEETING_SHEETS:
+                    continue
+
+                meeting_key = ws.Range("G1").Value
+                meeting_key = str(meeting_key).strip() if meeting_key else sheet_name
+                meeting_ratings = SR.get(meeting_key, {})
+                if not meeting_ratings:
+                    continue
+
+                used = ws.UsedRange
+                last_row = int(used.Row) + int(used.Rows.Count) - 1
+                if last_row < 1:
+                    continue
+
+                # Column D: horse names. Pull in one go.
+                values = ws.Range(f"D1:D{last_row}").Value
+                # values is tuple-of-tuples (or single tuple) depending on range size
+                if values is None:
+                    continue
+
+                # Pre-normalize meeting keys for faster lookup
+                norm_map = {normalize_horse(k): v for k, v in meeting_ratings.items()}
+
+                for idx, row_val in enumerate(values, start=1):
+                    cell_val = row_val[0] if isinstance(row_val, (tuple, list)) else row_val
+                    if cell_val is None:
+                        continue
+                    s = str(cell_val).strip()
+                    if not s:
+                        continue
+
+                    data = norm_map.get(normalize_horse(s))
+                    if not data:
+                        continue
+
+                    sb_rating = data.get("sb_rating") if isinstance(data, dict) else data
+                    win_fixed = data.get("win_fixed") if isinstance(data, dict) else None
+
+                    if sb_rating is not None:
+                        ws.Cells(idx, 25).Value = sb_rating  # Y
+                    if win_fixed is not None:
+                        try:
+                            ws.Cells(idx, 22).Value = float(win_fixed)  # V
+                        except Exception:
+                            ws.Cells(idx, 22).Value = win_fixed
+
+            try:
+                wb.Save()
+                print(f"Workbook saved via Excel: {excel_file_abs}", flush=True)
+            except pywintypes.com_error as ce:
+                # Don't crash with traceback; Excel may refuse save if file is opened twice.
+                msg = str(ce)
+                if "sharing violation" in msg.lower():
+                    print(
+                        "Excel could not save due to a sharing violation. "
+                        "This usually means the workbook is open in another Excel instance/process. "
+                        "Close other Excel windows for this file and press Ctrl+S in Excel, or rerun.",
+                        flush=True,
+                    )
+                    return
+                print(f"Excel Save() failed: {ce}", flush=True)
+                return
+        finally:
+            try:
+                xl.DisplayAlerts = prev_alerts
+            except Exception:
+                pass
+
+    finally:
+        pass
 
 
 def main():

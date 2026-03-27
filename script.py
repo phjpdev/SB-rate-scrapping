@@ -2,6 +2,7 @@ import re
 import os
 import sys
 import time
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -95,6 +96,12 @@ def extract_sb_rating(driver, race_url, meeting_key: str):
 
             soup = BeautifulSoup(driver.page_source, "html.parser")
 
+            row = soup.select_one(
+                f"div[data-automation-id='racecard-outcome-{runner_id}']"
+            )
+            if not row:
+                continue
+
             horse_el = soup.select_one(
                 f"div[data-automation-id='racecard-outcome-{runner_id}'] "
                 "div[data-automation-id='racecard-outcome-name'] span"
@@ -114,10 +121,23 @@ def extract_sb_rating(driver, race_url, meeting_key: str):
 
             sb_rating = sb_el.get_text(strip=True)
 
-            SR.setdefault(meeting_key, {})
-            SR[meeting_key][horse_name] = sb_rating
+            win_fixed = None
+            win_el = row.select_one("[data-automation-id='racecard-outcome-0-L-price']")
+            if win_el:
+                t = win_el.get_text(" ", strip=True)
+                if t and re.fullmatch(r"\d{1,3}\.\d{2}", t):
+                    win_fixed = t
 
-            print(f"[OK] {horse_name} -> SB Rating {sb_rating}", flush=True)
+            SR.setdefault(meeting_key, {})
+            SR[meeting_key].setdefault(horse_name, {})
+            SR[meeting_key][horse_name]["sb_rating"] = sb_rating
+            if win_fixed is not None:
+                SR[meeting_key][horse_name]["win_fixed"] = win_fixed
+
+            if win_fixed is not None:
+                print(f"[OK] {horse_name} -> SB Rating {sb_rating} | Win Fixed {win_fixed}", flush=True)
+            else:
+                print(f"[OK] {horse_name} -> SB Rating {sb_rating}", flush=True)
 
         except Exception:
             # intentionally silent – DOM instability
@@ -399,16 +419,38 @@ def save_sb_to_excel(excel_file, SR):
 
             excel_horse = normalize_horse(str(horse_cell.value))
 
-            for sb_horse, sb_rating in meeting_ratings.items():
+            for sb_horse, data in meeting_ratings.items():
                 if normalize_horse(sb_horse) == excel_horse:
-                    sheet.cell(row=horse_cell.row, column=25, value=sb_rating)
-                    print(
-                        f"Saved | {horse_cell.value} -> {sb_rating}",
-                        flush=True,
-                    )
+                    sb_rating = data.get("sb_rating") if isinstance(data, dict) else data
+                    win_fixed = data.get("win_fixed") if isinstance(data, dict) else None
+
+                    if sb_rating is not None:
+                        sheet.cell(row=horse_cell.row, column=25, value=sb_rating)  # Y Sportsbet Rating
+                    if win_fixed is not None:
+                        sheet.cell(row=horse_cell.row, column=22, value=float(win_fixed))  # V Sportsbet Odds (Win Fixed)
+
+                    msg = f"Saved | {horse_cell.value}"
+                    if sb_rating is not None:
+                        msg += f" | SB {sb_rating}"
+                    if win_fixed is not None:
+                        msg += f" | Win {win_fixed}"
+                    print(msg, flush=True)
                     break
 
-    workbook.save(excel_file)
+    try:
+        workbook.save(excel_file)
+        print(f"Workbook saved: {excel_file}", flush=True)
+    except PermissionError:
+        # Common on Windows when the workbook is open in Excel.
+        base, ext = os.path.splitext(excel_file)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        alt = f"{base}_UPDATED_{ts}{ext or '.xlsm'}"
+        workbook.save(alt)
+        print(
+            f"Could not overwrite '{excel_file}' (file is in use). "
+            f"Saved to: {alt}. Close Excel then rename/replace if needed.",
+            flush=True,
+        )
 
 
 def main():

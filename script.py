@@ -63,7 +63,7 @@ def extract_sb_rating(driver, race_url, meeting_key: str):
     race_no = parsed[1] if parsed else None
 
     driver.get(BASE_URL + race_url)
-    wait = WebDriverWait(driver, 15)
+    wait = WebDriverWait(driver, 20)
 
     wait.until(
         EC.presence_of_element_located(
@@ -71,50 +71,62 @@ def extract_sb_rating(driver, race_url, meeting_key: str):
         )
     )
 
-    runner_ids = [
-        el.get_attribute("data-automation-id").replace("racecard-outcome-", "")
-        for el in driver.find_elements(
-            By.CSS_SELECTOR,
-            "div[data-automation-id^='racecard-outcome-']")
-    ]
-
     if race_no:
         print(f"=== {meeting_key} R{race_no} === {race_url}", flush=True)
     else:
         print(f"=== {meeting_key} === {race_url}", flush=True)
 
-    for runner_id in runner_ids:
+    # Speed optimization (from script-111.py):
+    # Expand Form once and parse all runner shortforms in one pass.
+    try:
+        expand_btn = wait.until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "span[data-automation-id='racecard-expand-form']")
+            )
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", expand_btn)
+        time.sleep(0.15)
+        driver.execute_script("arguments[0].click();", expand_btn)
+    except Exception:
+        # already expanded or not present
+        pass
+
+    try:
+        wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "div[data-automation-id^='shortform-']")
+            )
+        )
+    except Exception:
+        # If shortforms never appear, skip this race.
+        return
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    shortforms = soup.select("div[data-automation-id^='shortform-']")
+
+    for sf in shortforms:
         try:
-            r = driver.find_element(
-                By.CSS_SELECTOR,
+            sf_id = sf.get("data-automation-id", "")
+            m = re.search(r"shortform-(\d+)", sf_id)
+            if not m:
+                continue
+            runner_id = m.group(1)
+
+            racecard = soup.select_one(
                 f"div[data-automation-id='racecard-outcome-{runner_id}']"
             )
-
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", r
-            )
-            driver.execute_script("arguments[0].click();", r)
-
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-
-            row = soup.select_one(
-                f"div[data-automation-id='racecard-outcome-{runner_id}']"
-            )
-            if not row:
+            if not racecard:
                 continue
 
-            horse_el = soup.select_one(
-                f"div[data-automation-id='racecard-outcome-{runner_id}'] "
+            name_el = racecard.select_one(
                 "div[data-automation-id='racecard-outcome-name'] span"
             )
-            if not horse_el:
+            if not name_el:
                 continue
 
-            raw_name = horse_el.get_text(strip=True)
-            horse_name = re.sub(r"^\d+\.\s*", "", raw_name)
+            horse_name = re.sub(r"^\d+\.\s*", "", name_el.get_text(strip=True))
 
-            sb_el = soup.select_one(
-                f"div[data-automation-id='shortform-{runner_id}'] "
+            sb_el = sf.select_one(
                 "div[data-automation-id='shortform-SB Rating'] span:last-child"
             )
             if not sb_el:
@@ -123,7 +135,7 @@ def extract_sb_rating(driver, race_url, meeting_key: str):
             sb_rating = sb_el.get_text(strip=True)
 
             win_fixed = None
-            win_el = row.select_one("[data-automation-id='racecard-outcome-0-L-price']")
+            win_el = racecard.select_one("[data-automation-id='racecard-outcome-0-L-price']")
             if win_el:
                 t = win_el.get_text(" ", strip=True)
                 if t and re.fullmatch(r"\d{1,3}\.\d{2}", t):
@@ -141,7 +153,6 @@ def extract_sb_rating(driver, race_url, meeting_key: str):
                 print(f"[OK] {horse_name} -> SB Rating {sb_rating}", flush=True)
 
         except Exception:
-            # intentionally silent – DOM instability
             continue
 
 def disable_international_filter(driver):
@@ -413,30 +424,33 @@ def save_sb_to_excel(excel_file, SR):
         if not meeting_ratings:
             continue
 
+        # Speed: prebuild lookup map once per sheet
+        norm_map = {normalize_horse(k): v for k, v in meeting_ratings.items()}
+
         for row in sheet.iter_rows(min_row=1):
             horse_cell = row[3]  # Column D
             if not horse_cell.value:
                 continue
 
             excel_horse = normalize_horse(str(horse_cell.value))
+            data = norm_map.get(excel_horse)
+            if not data:
+                continue
 
-            for sb_horse, data in meeting_ratings.items():
-                if normalize_horse(sb_horse) == excel_horse:
-                    sb_rating = data.get("sb_rating") if isinstance(data, dict) else data
-                    win_fixed = data.get("win_fixed") if isinstance(data, dict) else None
+            sb_rating = data.get("sb_rating") if isinstance(data, dict) else data
+            win_fixed = data.get("win_fixed") if isinstance(data, dict) else None
 
-                    if sb_rating is not None:
-                        sheet.cell(row=horse_cell.row, column=25, value=sb_rating)  # Y Sportsbet Rating
-                    if win_fixed is not None:
-                        sheet.cell(row=horse_cell.row, column=22, value=float(win_fixed))  # V Sportsbet Odds (Win Fixed)
+            if sb_rating is not None:
+                sheet.cell(row=horse_cell.row, column=25, value=sb_rating)  # Y Sportsbet Rating
+            if win_fixed is not None:
+                sheet.cell(row=horse_cell.row, column=22, value=float(win_fixed))  # V Sportsbet Odds (Win Fixed)
 
-                    msg = f"Saved | {horse_cell.value}"
-                    if sb_rating is not None:
-                        msg += f" | SB {sb_rating}"
-                    if win_fixed is not None:
-                        msg += f" | Win {win_fixed}"
-                    print(msg, flush=True)
-                    break
+            msg = f"Saved | {horse_cell.value}"
+            if sb_rating is not None:
+                msg += f" | SB {sb_rating}"
+            if win_fixed is not None:
+                msg += f" | Win {win_fixed}"
+            print(msg, flush=True)
 
     try:
         workbook.save(excel_file)

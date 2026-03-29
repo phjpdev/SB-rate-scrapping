@@ -79,6 +79,20 @@ def extract_sb_rating(driver, race_url, meeting_key: str):
     # Speed optimization (from script-111.py):
     # Expand Form once and parse all runner shortforms in one pass.
     try:
+        # Ensure Fast Form is ON (shortform blocks depend on it)
+        if not driver.find_elements(By.CSS_SELECTOR, "[data-automation-id='racecard-fastform-toggle-on']"):
+            fast_toggle = wait.until(
+                EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR, "[data-automation-id='racecard-fastform-toggle']")
+                )
+            )
+            driver.execute_script("arguments[0].click();", fast_toggle)
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "[data-automation-id='racecard-fastform-toggle-on']")
+                )
+            )
+
         expand_btn = wait.until(
             EC.element_to_be_clickable(
                 (By.CSS_SELECTOR, "span[data-automation-id='racecard-expand-form']")
@@ -91,69 +105,89 @@ def extract_sb_rating(driver, race_url, meeting_key: str):
         # already expanded or not present
         pass
 
+    # Best-effort: wait for shortforms (SB Rating lives there). If it never appears,
+    # we can still capture odds from the racecard rows.
     try:
-        wait.until(
+        WebDriverWait(driver, 10).until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "div[data-automation-id^='shortform-']")
             )
         )
     except Exception:
-        # If shortforms never appear, skip this race.
-        return
+        pass
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
-    shortforms = soup.select("div[data-automation-id^='shortform-']")
 
-    for sf in shortforms:
-        try:
-            sf_id = sf.get("data-automation-id", "")
-            m = re.search(r"shortform-(\d+)", sf_id)
-            if not m:
-                continue
-            runner_id = m.group(1)
+    # Build runner_id -> (horse_name, win_fixed) from racecards
+    by_runner: dict[str, dict] = {}
+    for racecard in soup.select("div[data-automation-id^='racecard-outcome-']"):
+        rid = racecard.get("data-automation-id", "").replace("racecard-outcome-", "")
+        if not rid.isdigit():
+            continue
 
-            racecard = soup.select_one(
-                f"div[data-automation-id='racecard-outcome-{runner_id}']"
-            )
-            if not racecard:
-                continue
+        name_el = racecard.select_one("div[data-automation-id='racecard-outcome-name'] span")
+        if not name_el:
+            continue
 
-            name_el = racecard.select_one(
-                "div[data-automation-id='racecard-outcome-name'] span"
-            )
-            if not name_el:
-                continue
+        horse_name = re.sub(r"^\d+\.\s*", "", name_el.get_text(strip=True))
+        if not horse_name:
+            continue
 
-            horse_name = re.sub(r"^\d+\.\s*", "", name_el.get_text(strip=True))
+        win_fixed = None
 
-            sb_el = sf.select_one(
-                "div[data-automation-id='shortform-SB Rating'] span:last-child"
-            )
-            if not sb_el:
-                continue
+        # Best: runner-specific odds button text
+        odds_el = racecard.select_one(
+            f"[data-automation-id^='outcome-{rid}-'][data-automation-id$='-odds-button-text']"
+        )
+        if odds_el:
+            t = odds_el.get_text(" ", strip=True)
+            if t and re.fullmatch(r"\d{1,4}\.\d{2}", t):
+                win_fixed = t
 
-            sb_rating = sb_el.get_text(strip=True)
-
-            win_fixed = None
+        # Fallback: first price cell in runner row
+        if win_fixed is None:
             win_el = racecard.select_one("[data-automation-id='racecard-outcome-0-L-price']")
             if win_el:
                 t = win_el.get_text(" ", strip=True)
-                if t and re.fullmatch(r"\d{1,3}\.\d{2}", t):
+                if t and re.fullmatch(r"\d{1,4}\.\d{2}", t):
                     win_fixed = t
 
-            SR.setdefault(meeting_key, {})
-            SR[meeting_key].setdefault(horse_name, {})
-            SR[meeting_key][horse_name]["sb_rating"] = sb_rating
-            if win_fixed is not None:
-                SR[meeting_key][horse_name]["win_fixed"] = win_fixed
+        by_runner[rid] = {"horse_name": horse_name, "win_fixed": win_fixed}
 
-            if win_fixed is not None:
-                print(f"[OK] {horse_name} -> SB Rating {sb_rating} | Win Fixed {win_fixed}", flush=True)
-            else:
-                print(f"[OK] {horse_name} -> SB Rating {sb_rating}", flush=True)
-
-        except Exception:
+    # runner_id -> sb_rating from shortforms (if available)
+    sb_by_runner: dict[str, str] = {}
+    for sf in soup.select("div[data-automation-id^='shortform-']"):
+        sf_id = sf.get("data-automation-id", "")
+        m = re.search(r"shortform-(\d+)", sf_id)
+        if not m:
             continue
+        rid = m.group(1)
+        sb_el = sf.select_one("div[data-automation-id='shortform-SB Rating'] span:last-child")
+        if not sb_el:
+            continue
+        sb_by_runner[rid] = sb_el.get_text(strip=True)
+
+    # Merge and save
+    SR.setdefault(meeting_key, {})
+    for rid, info in by_runner.items():
+        horse_name = info.get("horse_name")
+        if not horse_name:
+            continue
+
+        SR[meeting_key].setdefault(horse_name, {})
+        sb_rating = sb_by_runner.get(rid)
+        if sb_rating is not None:
+            SR[meeting_key][horse_name]["sb_rating"] = sb_rating
+        win_fixed = info.get("win_fixed")
+        if win_fixed is not None:
+            SR[meeting_key][horse_name]["win_fixed"] = win_fixed
+
+        if sb_rating is not None and win_fixed is not None:
+            print(f"[OK] {horse_name} -> SB Rating {sb_rating} | Win Fixed {win_fixed}", flush=True)
+        elif sb_rating is not None:
+            print(f"[OK] {horse_name} -> SB Rating {sb_rating}", flush=True)
+        elif win_fixed is not None:
+            print(f"[OK] {horse_name} | Win Fixed {win_fixed}", flush=True)
 
 def disable_international_filter(driver):
     wait = WebDriverWait(driver, 20)
